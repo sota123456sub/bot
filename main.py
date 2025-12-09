@@ -520,7 +520,7 @@ async def create_faction_cmd(interaction: discord.Interaction, name: str):
     await user.add_roles(faction_role, leader_role)
 
     # カテゴリ
-    category = await guild.create_category(f"派閥: {name}")
+    category: discord.CategoryChannel = await guild.create_category(f"派閥: {name}")
 
     overwrites_common = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -539,11 +539,13 @@ async def create_faction_cmd(interaction: discord.Interaction, name: str):
         ),
     }
 
-    # 初期チャンネル
-    forum_ch = await guild.create_text_channel(
-        "フォーラム", category=category, overwrites=overwrites_common,
-        topic=f"{name} のフォーラム"
+    # --- ここをフォーラムチャンネルに変更 ---
+    forum_ch = await category.create_forum(
+        "フォーラム",
+        overwrites=overwrites_common,
+        topic=f"{name} のフォーラム",
     )
+
     chat_ch = await guild.create_text_channel(
         "雑談", category=category, overwrites=overwrites_common,
         topic=f"{name} の雑談チャンネル"
@@ -1246,11 +1248,14 @@ async def setup_global_cmd(interaction: discord.Interaction):
         )
         return
 
-    category = await guild.create_category("全体")
+    category: discord.CategoryChannel = await guild.create_category("全体")
 
     # テキスト
     await guild.create_text_channel("全体雑談", category=category)
-    await guild.create_text_channel("フォーラム", category=category)
+
+    # --- 全体用フォーラムチャンネル ---
+    await category.create_forum("フォーラム")
+
     await guild.create_text_channel("管理者への意見", category=category)
 
     # VC
