@@ -41,6 +41,40 @@ intents.guilds = True
 last_message_times: dict[int, datetime] = {}  # 通貨用クールダウン
 
 
+# ===================== 共通: フォーラム作成ヘルパー =====================
+
+async def create_forum_channel(
+    guild: discord.Guild,
+    name: str,
+    category: Optional[discord.CategoryChannel] = None,
+    overwrites=None,
+    topic: Optional[str] = None,
+):
+    """discord.py のバージョン差を吸収してフォーラムチャンネルを作る"""
+    kwargs = {}
+    if category is not None:
+        kwargs["category"] = category
+    if overwrites is not None:
+        kwargs["overwrites"] = overwrites
+    if topic is not None:
+        kwargs["topic"] = topic
+
+    if hasattr(guild, "create_forum"):
+        # discord.py 2.3 以降想定
+        return await guild.create_forum(name=name, **kwargs)
+    elif hasattr(guild, "create_forum_channel"):
+        # 一部バージョン
+        return await guild.create_forum_channel(name, **kwargs)
+    else:
+        # フォーラム未対応ならテキストチャンネルで代用
+        return await guild.create_text_channel(
+            name=name,
+            category=category,
+            overwrites=overwrites,
+            topic=topic,
+        )
+
+
 # ===================== DB 初期化 =====================
 
 async def init_db():
@@ -539,39 +573,35 @@ async def create_faction_cmd(interaction: discord.Interaction, name: str):
         ),
     }
 
-    # --- ここをフォーラムチャンネルに変更 ---
-    forum_ch = await category.create_forum(
+    # フォーラム
+    forum_ch = await create_forum_channel(
+        guild,
         "フォーラム",
+        category=category,
         overwrites=overwrites_common,
         topic=f"{name} のフォーラム",
     )
 
+    # 雑談テキスト
     chat_ch = await guild.create_text_channel(
         "雑談", category=category, overwrites=overwrites_common,
         topic=f"{name} の雑談チャンネル"
     )
+
+    # VC（普通のボイス）
     vc_ch = await guild.create_voice_channel(
         "VC", category=category, overwrites=overwrites_common
     )
 
-    # 聞き専 VC
-    overwrites_listen = overwrites_common.copy()
-    overwrites_listen[faction_role] = discord.PermissionOverwrite(
-        view_channel=True, connect=True, speak=False
-    )
-    overwrites_listen[leader_role] = discord.PermissionOverwrite(
-        view_channel=True, connect=True, speak=True,
-        manage_channels=True, manage_roles=True
-    )
-    overwrites_listen[officer_role] = discord.PermissionOverwrite(
-        view_channel=True, connect=True, speak=True,
-        manage_channels=True
-    )
-    listen_vc_ch = await guild.create_voice_channel(
-        "VC聞き専", category=category, overwrites=overwrites_listen
+    # 聞き専テキストチャンネル
+    listen_vc_ch = await guild.create_text_channel(
+        "VC聞き専",
+        category=category,
+        overwrites=overwrites_common,
+        topic=f"{name} のVC聞き専テキストチャンネル",
     )
 
-    # コントロールパネル
+    # コントロールパネル（権限者のみ）
     overwrites_panel = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
         leader_role: discord.PermissionOverwrite(
@@ -1253,8 +1283,8 @@ async def setup_global_cmd(interaction: discord.Interaction):
     # テキスト
     await guild.create_text_channel("全体雑談", category=category)
 
-    # --- 全体用フォーラムチャンネル ---
-    await category.create_forum("フォーラム")
+    # 全体用フォーラム
+    await create_forum_channel(guild, "フォーラム", category=category)
 
     await guild.create_text_channel("管理者への意見", category=category)
 
@@ -1262,20 +1292,9 @@ async def setup_global_cmd(interaction: discord.Interaction):
     await guild.create_voice_channel("全体VC1", category=category)
     await guild.create_voice_channel("全体VC2", category=category)
 
-    # 聞き専 VC
-    overwrites_listen = {
-        guild.default_role: discord.PermissionOverwrite(
-            view_channel=True,
-            connect=True,
-            speak=False,
-        )
-    }
-    await guild.create_voice_channel(
-        "全体VC聞き専1", category=category, overwrites=overwrites_listen
-    )
-    await guild.create_voice_channel(
-        "全体VC聞き専2", category=category, overwrites=overwrites_listen
-    )
+    # 聞き専テキストチャンネル
+    await guild.create_text_channel("全体VC聞き専1", category=category)
+    await guild.create_text_channel("全体VC聞き専2", category=category)
 
     # 戦争状況チャンネル
     war_channel = await guild.create_text_channel("戦争状況", category=category)
