@@ -1,0 +1,1497 @@
+import os
+from datetime import datetime, timedelta
+from typing import Optional
+
+import discord
+from discord.ext import commands
+from discord import app_commands
+import aiosqlite
+
+COMMAND_PREFIX = "!"
+FACTION_CREATE_COST = 1000  # 派閥作成コスト
+DB_PATH = "bot.db"
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.guilds = True
+
+# ユーザーごとの最後の発言時刻（通貨用）
+last_message_times: dict[int, datetime] = {}
+
+
+# ===================== DB 初期化 =====================
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        # 所持金
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                balance INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        # 派閥
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS factions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                leader_id INTEGER NOT NULL,
+                base_role_id INTEGER NOT NULL,
+                leader_role_id INTEGER NOT NULL,
+                officer_role_id INTEGER NOT NULL,
+                category_id INTEGER NOT NULL,
+                forum_channel_id INTEGER NOT NULL,
+                chat_channel_id INTEGER NOT NULL,
+                vc_channel_id INTEGER NOT NULL,
+                listen_vc_channel_id INTEGER NOT NULL,
+                control_panel_channel_id INTEGER NOT NULL,
+                destroyed INTEGER NOT NULL DEFAULT 0,
+                is_open INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        # 派閥メンバー
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS faction_members (
+                user_id INTEGER NOT NULL,
+                faction_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                PRIMARY KEY (user_id, faction_id)
+            );
+            """
+        )
+        # 戦争
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS wars (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                attacker_faction_id INTEGER NOT NULL,
+                defender_faction_id INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                attacker_messages INTEGER NOT NULL DEFAULT 0,
+                defender_messages INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        # ギルド設定（戦争状況チャンネル）
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                war_status_channel_id INTEGER
+            );
+            """
+        )
+        # 既存DB向け：is_open カラムをなければ追加
+        try:
+            await db.execute(
+                "ALTER TABLE factions ADD COLUMN is_open INTEGER NOT NULL DEFAULT 0;"
+            )
+        except Exception:
+            # すでにあれば無視
+            pass
+
+        await db.commit()
+
+
+# ===================== 通貨関連 =====================
+
+async def get_balance(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT balance FROM users WHERE user_id = ?", (user_id,)
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row:
+            return row[0]
+        await db.execute(
+            "INSERT INTO users (user_id, balance) VALUES (?, ?)",
+            (user_id, 0),
+        )
+        await db.commit()
+        return 0
+
+
+async def add_balance(user_id: int, amount: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT balance FROM users WHERE user_id = ?", (user_id,)
+        )
+        row = await cur.fetchone()
+        if row:
+            new_balance = row[0] + amount
+            await db.execute(
+                "UPDATE users SET balance = ? WHERE user_id = ?",
+                (new_balance, user_id),
+            )
+        else:
+            new_balance = amount
+            await db.execute(
+                "INSERT INTO users (user_id, balance) VALUES (?, ?)",
+                (user_id, new_balance),
+            )
+        await db.commit()
+        await cur.close()
+        return new_balance
+
+
+async def remove_balance(user_id: int, amount: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT balance FROM users WHERE user_id = ?", (user_id,)
+        )
+        row = await cur.fetchone()
+        if not row or row[0] < amount:
+            await cur.close()
+            return False
+        new_balance = row[0] - amount
+        await db.execute(
+            "UPDATE users SET balance = ? WHERE user_id = ?",
+            (new_balance, user_id),
+        )
+        await db.commit()
+        await cur.close()
+        return True
+
+
+# ===================== 派閥関連 =====================
+
+async def get_user_faction_id(user_id: int, guild_id: int) -> Optional[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT f.id
+            FROM faction_members fm
+            JOIN factions f ON fm.faction_id = f.id
+            WHERE fm.user_id = ? AND f.guild_id = ? AND f.destroyed = 0
+            """,
+            (user_id, guild_id),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row[0] if row else None
+
+
+async def get_faction_by_name(name: str, guild_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT id, name, leader_id, base_role_id, leader_role_id, officer_role_id,
+                   category_id, forum_channel_id, chat_channel_id, vc_channel_id,
+                   listen_vc_channel_id, control_panel_channel_id, destroyed, is_open
+            FROM factions
+            WHERE guild_id = ? AND name = ? AND destroyed = 0
+            """,
+            (guild_id, name),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row
+
+
+async def get_faction_by_id(faction_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT id, guild_id, name, leader_id, base_role_id, leader_role_id, officer_role_id,
+                   category_id, forum_channel_id, chat_channel_id, vc_channel_id,
+                   listen_vc_channel_id, control_panel_channel_id, destroyed, is_open
+            FROM factions
+            WHERE id = ?
+            """,
+            (faction_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row
+
+
+async def add_faction_member(user_id: int, faction_id: int, role: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO faction_members (user_id, faction_id, role)
+            VALUES (?, ?, ?)
+            """,
+            (user_id, faction_id, role),
+        )
+        await db.commit()
+
+
+async def remove_faction_member(user_id: int, faction_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM faction_members WHERE user_id = ? AND faction_id = ?",
+            (user_id, faction_id),
+        )
+        await db.commit()
+
+
+async def get_faction_role(user_id: int, guild_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT fm.faction_id, fm.role
+            FROM faction_members fm
+            JOIN factions f ON fm.faction_id = f.id
+            WHERE fm.user_id = ? AND f.guild_id = ? AND f.destroyed = 0
+            """,
+            (user_id, guild_id),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row:
+            return row[0], row[1]
+        return None, None
+
+
+# ===================== 戦争関連 =====================
+
+async def get_active_war(guild_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT id, attacker_faction_id, defender_faction_id,
+                   attacker_messages, defender_messages
+            FROM wars
+            WHERE guild_id = ? AND active = 1
+            """,
+            (guild_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row
+
+
+async def add_message_for_war(user_id: int, guild_id: int):
+    faction_id = await get_user_faction_id(user_id, guild_id)
+    if not faction_id:
+        return
+
+    war = await get_active_war(guild_id)
+    if not war:
+        return
+
+    war_id, attacker_id, defender_id, attacker_msgs, defender_msgs = war
+    if faction_id not in (attacker_id, defender_id):
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        if faction_id == attacker_id:
+            attacker_msgs += 1
+            await db.execute(
+                "UPDATE wars SET attacker_messages = ? WHERE id = ?",
+                (attacker_msgs, war_id),
+            )
+        else:
+            defender_msgs += 1
+            await db.execute(
+                "UPDATE wars SET defender_messages = ? WHERE id = ?",
+                (defender_msgs, war_id),
+            )
+        await db.commit()
+
+
+# ===================== ギルド設定（戦争状況チャンネル） =====================
+
+async def get_guild_war_status_channel_id(guild_id: int) -> Optional[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT war_status_channel_id FROM guild_settings WHERE guild_id = ?",
+            (guild_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row[0] if row else None
+
+
+async def set_guild_war_status_channel_id(guild_id: int, channel_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO guild_settings (guild_id, war_status_channel_id)
+            VALUES (?, ?)
+            """,
+            (guild_id, channel_id),
+        )
+        await db.commit()
+
+
+async def get_war_status_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    channel_id = await get_guild_war_status_channel_id(guild.id)
+    if channel_id:
+        channel = guild.get_channel(channel_id)
+        if isinstance(channel, discord.TextChannel):
+            return channel
+    return None
+
+
+# ===================== 派閥解体（戦争敗北など） =====================
+
+async def destroy_faction(guild: discord.Guild, faction_row):
+    (
+        faction_id,
+        guild_id,
+        name,
+        leader_id,
+        base_role_id,
+        leader_role_id,
+        officer_role_id,
+        category_id,
+        forum_channel_id,
+        chat_channel_id,
+        vc_channel_id,
+        listen_vc_channel_id,
+        control_panel_channel_id,
+        destroyed,
+        is_open,
+    ) = faction_row
+
+    # 派閥チャンネル削除
+    for cid in [
+        forum_channel_id,
+        chat_channel_id,
+        vc_channel_id,
+        listen_vc_channel_id,
+        control_panel_channel_id,
+    ]:
+        ch = guild.get_channel(cid)
+        if ch:
+            try:
+                if isinstance(ch, (discord.TextChannel, discord.VoiceChannel, discord.CategoryChannel)):
+                    await ch.delete(reason="Faction destroyed by war")
+            except discord.HTTPException:
+                pass
+
+    # カテゴリ削除
+    category = guild.get_channel(category_id)
+    if category:
+        try:
+            await category.delete(reason="Faction destroyed by war")
+        except discord.HTTPException:
+            pass
+
+    # ロール削除
+    for rid in [base_role_id, leader_role_id, officer_role_id]:
+        role = guild.get_role(rid)
+        if role:
+            try:
+                await role.delete(reason="Faction destroyed by war")
+            except discord.HTTPException:
+                pass
+
+    # DB更新
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE factions SET destroyed = 1 WHERE id = ?",
+            (faction_id,),
+        )
+        await db.execute(
+            "DELETE FROM faction_members WHERE faction_id = ?",
+            (faction_id,),
+        )
+        await db.commit()
+
+
+# ===================== Bot 本体 =====================
+
+class FactionBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix=COMMAND_PREFIX, intents=intents)
+
+    async def setup_hook(self):
+        await init_db()
+        try:
+            synced = await self.tree.sync()
+            print(f"Synced {len(synced)} command(s).")
+        except Exception as e:
+            print(f"Failed to sync commands: {e}")
+
+
+bot = FactionBot()
+
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or message.guild is None:
+        return
+
+    # 10秒に1回、1メッセージ = 1コイン
+    now = datetime.utcnow()
+    last = last_message_times.get(message.author.id)
+    if last is None or (now - last) >= timedelta(seconds=10):
+        last_message_times[message.author.id] = now
+        await add_balance(message.author.id, 1)
+
+    # 戦争メッセージ数カウント
+    await add_message_for_war(message.author.id, message.guild.id)
+
+    await bot.process_commands(message)
+
+
+# ===================== 通貨コマンド =====================
+
+@bot.tree.command(name="money", description="自分または指定ユーザーの所持金を表示します")
+@app_commands.describe(user="確認したいユーザー（省略時は自分）")
+async def money_cmd(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    target = user or interaction.user
+    bal = await get_balance(target.id)
+    await interaction.response.send_message(
+        f"{target.mention} の所持金は `{bal}` コインです。"
+    )
+
+
+@bot.tree.command(name="give", description="管理者用: 指定ユーザーにコインを付与します")
+@app_commands.describe(user="付与するユーザー", amount="付与するコイン数")
+async def give_cmd(interaction: discord.Interaction, user: discord.Member, amount: int):
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "このコマンドは管理者のみが実行できます。",
+            ephemeral=True,
+        )
+        return
+
+    new_bal = await add_balance(user.id, amount)
+    await interaction.response.send_message(
+        f"{user.mention} に `{amount}` コイン付与しました。（合計: {new_bal}）"
+    )
+
+
+# ===================== 派閥コマンド =====================
+
+@bot.tree.command(name="create_faction", description="新しい派閥を作成します")
+@app_commands.describe(name="作成する派閥名")
+async def create_faction_cmd(interaction: discord.Interaction, name: str):
+    guild = interaction.guild
+    user = interaction.user
+
+    if guild is None or not isinstance(user, discord.Member):
+        await interaction.response.send_message(
+            "サーバー内で実行してください。",
+            ephemeral=True,
+        )
+        return
+
+    # 既に派閥所属していないか
+    existing_faction_id = await get_user_faction_id(user.id, guild.id)
+    if existing_faction_id:
+        await interaction.response.send_message(
+            "すでに派閥に所属しています。",
+            ephemeral=True,
+        )
+        return
+
+    # 所持金チェック
+    if not await remove_balance(user.id, FACTION_CREATE_COST):
+        bal = await get_balance(user.id)
+        await interaction.response.send_message(
+            f"お金が足りません。必要: {FACTION_CREATE_COST} / 所持: {bal}",
+            ephemeral=True,
+        )
+        return
+
+    # 同名派閥チェック
+    if await get_faction_by_name(name, guild.id):
+        await interaction.response.send_message(
+            "同じ名前の派閥が既に存在します。別の名前を使ってください。",
+            ephemeral=True,
+        )
+        return
+
+    # ロール作成
+    faction_role = await guild.create_role(
+        name=f"[派閥] {name}",
+        mentionable=True,
+    )
+    leader_role = await guild.create_role(
+        name=f"[派閥] {name} リーダー",
+        mentionable=True,
+    )
+    officer_role = await guild.create_role(
+        name=f"[派閥] {name} 幹部",
+        mentionable=True,
+    )
+
+    await user.add_roles(faction_role, leader_role)
+
+    # カテゴリ作成
+    category = await guild.create_category(f"派閥: {name}")
+
+    # 共通権限
+    overwrites_common = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        faction_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            connect=True,
+            speak=True,
+        ),
+        leader_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            connect=True,
+            speak=True,
+            manage_channels=True,
+            manage_roles=True,
+        ),
+        officer_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            connect=True,
+            speak=True,
+            manage_channels=True,
+        ),
+    }
+
+    # フォーラム(テキスト)
+    forum_ch = await guild.create_text_channel(
+        "フォーラム",
+        category=category,
+        overwrites=overwrites_common,
+        topic=f"{name} のフォーラム",
+    )
+
+    # 雑談
+    chat_ch = await guild.create_text_channel(
+        "雑談",
+        category=category,
+        overwrites=overwrites_common,
+        topic=f"{name} の雑談チャンネル",
+    )
+
+    # VC
+    vc_ch = await guild.create_voice_channel(
+        "VC",
+        category=category,
+        overwrites=overwrites_common,
+    )
+
+    # VC聞き専
+    overwrites_listen = overwrites_common.copy()
+    overwrites_listen[faction_role] = discord.PermissionOverwrite(
+        view_channel=True,
+        connect=True,
+        speak=False,
+    )
+    overwrites_listen[leader_role] = discord.PermissionOverwrite(
+        view_channel=True,
+        connect=True,
+        speak=True,
+        manage_channels=True,
+        manage_roles=True,
+    )
+    overwrites_listen[officer_role] = discord.PermissionOverwrite(
+        view_channel=True,
+        connect=True,
+        speak=True,
+        manage_channels=True,
+    )
+
+    listen_vc_ch = await guild.create_voice_channel(
+        "VC聞き専",
+        category=category,
+        overwrites=overwrites_listen,
+    )
+
+    # コントロールパネル
+    overwrites_panel = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        leader_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            manage_channels=True,
+            manage_roles=True,
+        ),
+        officer_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            manage_channels=True,
+        ),
+    }
+
+    control_panel_ch = await guild.create_text_channel(
+        "派閥コントロールパネル",
+        category=category,
+        overwrites=overwrites_panel,
+        topic=f"{name} の派閥管理用チャンネル",
+    )
+
+    # DBに保存
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            INSERT INTO factions (
+                guild_id, name, leader_id,
+                base_role_id, leader_role_id, officer_role_id,
+                category_id, forum_channel_id, chat_channel_id,
+                vc_channel_id, listen_vc_channel_id, control_panel_channel_id,
+                destroyed, is_open
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
+            """,
+            (
+                guild.id,
+                name,
+                user.id,
+                faction_role.id,
+                leader_role.id,
+                officer_role.id,
+                category.id,
+                forum_ch.id,
+                chat_ch.id,
+                vc_ch.id,
+                listen_vc_ch.id,
+                control_panel_ch.id,
+            ),
+        )
+        faction_id = cur.lastrowid
+        await db.commit()
+
+    await add_faction_member(user.id, faction_id, "leader")
+
+    await control_panel_ch.send(
+        f"{user.mention} 派閥 **{name}** が作成されました！\n"
+        "・メンバー招待: `/f_invite`\n"
+        "・メンバー追放: `/f_kick`\n"
+        "・幹部昇格: `/f_promote`\n"
+        "・幹部降格: `/f_demote`\n"
+        "・戦争開始: `/f_war_start`\n"
+        "・戦争終了: `/f_war_end`\n"
+        "・参加モード切替: `/f_set_open`\n"
+    )
+
+    await interaction.response.send_message(
+        f"派閥 **{name}** を作成しました！必要コスト `{FACTION_CREATE_COST}` コインを消費しました。"
+    )
+
+
+@bot.tree.command(name="f_invite", description="自分の派閥にメンバーを招待します")
+@app_commands.describe(member="招待するメンバー")
+async def faction_invite_cmd(interaction: discord.Interaction, member: discord.Member):
+    guild = interaction.guild
+    user = interaction.user
+
+    if guild is None or not isinstance(user, discord.Member):
+        await interaction.response.send_message(
+            "サーバー内でのみ使用できます。",
+            ephemeral=True,
+        )
+        return
+
+    my_faction_id, my_role = await get_faction_role(user.id, guild.id)
+    if not my_faction_id or my_role not in ("leader", "officer"):
+        await interaction.response.send_message(
+            "このコマンドは派閥のリーダーまたは幹部のみ使用できます。",
+            ephemeral=True,
+        )
+        return
+
+    if await get_user_faction_id(member.id, guild.id):
+        await interaction.response.send_message(
+            "そのユーザーは既にどこかの派閥に所属しています。",
+            ephemeral=True,
+        )
+        return
+
+    faction = await get_faction_by_id(my_faction_id)
+    if not faction or faction[13] == 1:
+        await interaction.response.send_message(
+            "派閥情報が見つかりません。",
+            ephemeral=True,
+        )
+        return
+
+    (
+        fid,
+        guild_id,
+        name,
+        leader_id,
+        base_role_id,
+        leader_role_id,
+        officer_role_id,
+        category_id,
+        forum_channel_id,
+        chat_channel_id,
+        vc_channel_id,
+        listen_vc_channel_id,
+        control_panel_channel_id,
+        destroyed,
+        is_open,
+    ) = faction
+
+    base_role = guild.get_role(base_role_id)
+    if not base_role:
+        await interaction.response.send_message(
+            "派閥ロールが見つかりません。管理者に連絡してください。",
+            ephemeral=True,
+        )
+        return
+
+    await member.add_roles(base_role)
+    await add_faction_member(member.id, my_faction_id, "member")
+    await interaction.response.send_message(
+        f"{member.mention} を派閥 **{name}** に招待しました。"
+    )
+
+
+@bot.tree.command(name="f_kick", description="派閥からメンバーを追放します")
+@app_commands.describe(member="追放するメンバー")
+async def faction_kick_cmd(interaction: discord.Interaction, member: discord.Member):
+    guild = interaction.guild
+    user = interaction.user
+
+    if guild is None or not isinstance(user, discord.Member):
+        await interaction.response.send_message(
+            "サーバー内でのみ使用できます。",
+            ephemeral=True,
+        )
+        return
+
+    my_faction_id, my_role = await get_faction_role(user.id, guild.id)
+    if not my_faction_id or my_role not in ("leader", "officer"):
+        await interaction.response.send_message(
+            "このコマンドは派閥のリーダーまたは幹部のみ使用できます。",
+            ephemeral=True,
+        )
+        return
+
+    target_faction_id = await get_user_faction_id(member.id, guild.id)
+    if target_faction_id != my_faction_id:
+        await interaction.response.send_message(
+            "そのユーザーはあなたの派閥に所属していません。",
+            ephemeral=True,
+        )
+        return
+
+    faction = await get_faction_by_id(my_faction_id)
+    if not faction:
+        await interaction.response.send_message(
+            "派閥情報が見つかりません。",
+            ephemeral=True,
+        )
+        return
+
+    (
+        fid,
+        guild_id,
+        name,
+        leader_id,
+        base_role_id,
+        leader_role_id,
+        officer_role_id,
+        category_id,
+        forum_channel_id,
+        chat_channel_id,
+        vc_channel_id,
+        listen_vc_channel_id,
+        control_panel_channel_id,
+        destroyed,
+        is_open,
+    ) = faction
+
+    if member.id == leader_id:
+        await interaction.response.send_message(
+            "リーダーは追放できません。",
+            ephemeral=True,
+        )
+        return
+
+    base_role = guild.get_role(base_role_id)
+    officer_role_obj = guild.get_role(officer_role_id)
+    roles_to_remove = []
+    if base_role and base_role in member.roles:
+        roles_to_remove.append(base_role)
+    if officer_role_obj and officer_role_obj in member.roles:
+        roles_to_remove.append(officer_role_obj)
+
+    if roles_to_remove:
+        await member.remove_roles(*roles_to_remove)
+
+    await remove_faction_member(member.id, my_faction_id)
+    await interaction.response.send_message(
+        f"{member.mention} を派閥 **{name}** から追放しました。"
+    )
+
+
+@bot.tree.command(name="f_promote", description="メンバーを幹部に昇格させます")
+@app_commands.describe(member="昇格させるメンバー")
+async def faction_promote_cmd(interaction: discord.Interaction, member: discord.Member):
+    guild = interaction.guild
+    user = interaction.user
+
+    if guild is None or not isinstance(user, discord.Member):
+        await interaction.response.send_message(
+            "サーバー内でのみ使用できます。",
+            ephemeral=True,
+        )
+        return
+
+    my_faction_id, my_role = await get_faction_role(user.id, guild.id)
+    if not my_faction_id or my_role not in ("leader", "officer"):
+        await interaction.response.send_message(
+            "このコマンドは派閥のリーダーまたは幹部のみ使用できます。",
+            ephemeral=True,
+        )
+        return
+
+    target_faction_id = await get_user_faction_id(member.id, guild.id)
+    if target_faction_id != my_faction_id:
+        await interaction.response.send_message(
+            "そのユーザーはあなたの派閥に所属していません。",
+            ephemeral=True,
+        )
+        return
+
+    faction = await get_faction_by_id(my_faction_id)
+    if not faction:
+        await interaction.response.send_message(
+            "派閥情報が見つかりません。",
+            ephemeral=True,
+        )
+        return
+
+    (
+        fid,
+        guild_id,
+        name,
+        leader_id,
+        base_role_id,
+        leader_role_id,
+        officer_role_id,
+        category_id,
+        forum_channel_id,
+        chat_channel_id,
+        vc_channel_id,
+        listen_vc_channel_id,
+        control_panel_channel_id,
+        destroyed,
+        is_open,
+    ) = faction
+
+    officer_role = guild.get_role(officer_role_id)
+    base_role = guild.get_role(base_role_id)
+    if not officer_role or not base_role:
+        await interaction.response.send_message(
+            "派閥ロールが見つかりません。",
+            ephemeral=True,
+        )
+        return
+
+    await member.add_roles(base_role, officer_role)
+    await add_faction_member(member.id, my_faction_id, "officer")
+    await interaction.response.send_message(
+        f"{member.mention} を派閥 **{name}** の幹部にしました。"
+    )
+
+
+@bot.tree.command(name="f_demote", description="幹部をメンバーに降格させます")
+@app_commands.describe(member="降格させるメンバー")
+async def faction_demote_cmd(interaction: discord.Interaction, member: discord.Member):
+    guild = interaction.guild
+    user = interaction.user
+
+    if guild is None or not isinstance(user, discord.Member):
+        await interaction.response.send_message(
+            "サーバー内でのみ使用できます。",
+            ephemeral=True,
+        )
+        return
+
+    my_faction_id, my_role = await get_faction_role(user.id, guild.id)
+    if not my_faction_id or my_role not in ("leader", "officer"):
+        await interaction.response.send_message(
+            "このコマンドは派閥のリーダーまたは幹部のみ使用できます。",
+            ephemeral=True,
+        )
+        return
+
+    target_faction_id = await get_user_faction_id(member.id, guild.id)
+    if target_faction_id != my_faction_id:
+        await interaction.response.send_message(
+            "そのユーザーはあなたの派閥に所属していません。",
+            ephemeral=True,
+        )
+        return
+
+    faction = await get_faction_by_id(my_faction_id)
+    if not faction:
+        await interaction.response.send_message(
+            "派閥情報が見つかりません。",
+            ephemeral=True,
+        )
+        return
+
+    (
+        fid,
+        guild_id,
+        name,
+        leader_id,
+        base_role_id,
+        leader_role_id,
+        officer_role_id,
+        category_id,
+        forum_channel_id,
+        chat_channel_id,
+        vc_channel_id,
+        listen_vc_channel_id,
+        control_panel_channel_id,
+        destroyed,
+        is_open,
+    ) = faction
+
+    officer_role_obj = guild.get_role(officer_role_id)
+    if officer_role_obj and officer_role_obj in member.roles:
+        await member.remove_roles(officer_role_obj)
+    await add_faction_member(member.id, my_faction_id, "member")
+    await interaction.response.send_message(
+        f"{member.mention} を派閥 **{name}** の幹部から降格しました。"
+    )
+
+
+@bot.tree.command(name="f_info", description="自分の所属している派閥情報を表示します")
+async def faction_info_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    user = interaction.user
+
+    if guild is None or not isinstance(user, discord.Member):
+        await interaction.response.send_message(
+            "サーバー内でのみ使用できます。",
+            ephemeral=True,
+        )
+        return
+
+    faction_id, role = await get_faction_role(user.id, guild.id)
+    if not faction_id:
+        await interaction.response.send_message(
+            "あなたはどの派閥にも所属していません。",
+            ephemeral=True,
+        )
+        return
+
+    faction = await get_faction_by_id(faction_id)
+    if not faction:
+        await interaction.response.send_message(
+            "派閥情報が見つかりません。",
+            ephemeral=True,
+        )
+        return
+
+    (
+        fid,
+        guild_id,
+        name,
+        leader_id,
+        base_role_id,
+        leader_role_id,
+        officer_role_id,
+        category_id,
+        forum_channel_id,
+        chat_channel_id,
+        vc_channel_id,
+        listen_vc_channel_id,
+        control_panel_channel_id,
+        destroyed,
+        is_open,
+    ) = faction
+
+    leader = guild.get_member(leader_id)
+    leader_name = leader.display_name if leader else "不明"
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM faction_members WHERE faction_id = ?",
+            (faction_id,),
+        )
+        member_count_row = await cur.fetchone()
+        await cur.close()
+    member_count = member_count_row[0] if member_count_row else 0
+
+    join_mode = "オープン（誰でも /f_join で参加可能）" if is_open else "クローズ（招待制）"
+
+    await interaction.response.send_message(
+        f"**{name}** の情報:\n"
+        f"・リーダー: {leader_name}\n"
+        f"・メンバー数: {member_count}\n"
+        f"・あなたの役職: {role}\n"
+        f"・参加モード: {join_mode}"
+    )
+
+
+@bot.tree.command(name="f_leave", description="所属している派閥から脱退します")
+async def faction_leave_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    user = interaction.user
+
+    if guild is None or not isinstance(user, discord.Member):
+        await interaction.response.send_message(
+            "サーバー内でのみ使用できます。",
+            ephemeral=True,
+        )
+        return
+
+    faction_id, role = await get_faction_role(user.id, guild.id)
+    if not faction_id:
+        await interaction.response.send_message(
+            "あなたはどの派閥にも所属していません。",
+            ephemeral=True,
+        )
+        return
+
+    faction = await get_faction_by_id(faction_id)
+    if not faction:
+        await interaction.response.send_message(
+            "派閥情報が見つかりません。",
+            ephemeral=True,
+        )
+        return
+
+    (
+        fid,
+        guild_id,
+        name,
+        leader_id,
+        base_role_id,
+        leader_role_id,
+        officer_role_id,
+        category_id,
+        forum_channel_id,
+        chat_channel_id,
+        vc_channel_id,
+        listen_vc_channel_id,
+        control_panel_channel_id,
+        destroyed,
+        is_open,
+    ) = faction
+
+    if user.id == leader_id:
+        await interaction.response.send_message(
+            "リーダーは脱退できません。（解散機能を別途実装してください）",
+            ephemeral=True,
+        )
+        return
+
+    base_role = guild.get_role(base_role_id)
+    officer_role_obj = guild.get_role(officer_role_id)
+    roles_to_remove = []
+    if base_role and base_role in user.roles:
+        roles_to_remove.append(base_role)
+    if officer_role_obj and officer_role_obj in user.roles:
+        roles_to_remove.append(officer_role_obj)
+    if roles_to_remove:
+        await user.remove_roles(*roles_to_remove)
+
+    await remove_faction_member(user.id, faction_id)
+    await interaction.response.send_message(
+        f"派閥 **{name}** から脱退しました。"
+    )
+
+
+# ===================== 参加モード（オープン / クローズ） =====================
+
+@bot.tree.command(name="f_set_open", description="派閥の参加モードをオープン/クローズに切り替えます")
+@app_commands.choices(
+    mode=[
+        app_commands.Choice(name="オープン（誰でも参加）", value="open"),
+        app_commands.Choice(name="クローズ（招待制）", value="close"),
+    ]
+)
+async def faction_set_open_cmd(interaction: discord.Interaction, mode: app_commands.Choice[str]):
+    guild = interaction.guild
+    user = interaction.user
+
+    if guild is None or not isinstance(user, discord.Member):
+        await interaction.response.send_message(
+            "サーバー内でのみ使用できます。",
+            ephemeral=True,
+        )
+        return
+
+    faction_id, role = await get_faction_role(user.id, guild.id)
+    if not faction_id or role not in ("leader", "officer"):
+        await interaction.response.send_message(
+            "このコマンドは派閥のリーダーまたは幹部のみ使用できます。",
+            ephemeral=True,
+        )
+        return
+
+    is_open = 1 if mode.value == "open" else 0
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE factions SET is_open = ? WHERE id = ?",
+            (is_open, faction_id),
+        )
+        await db.commit()
+
+    text = "オープン（誰でも /f_join で参加可能）" if is_open else "クローズ（招待制）"
+    await interaction.response.send_message(
+        f"あなたの派閥の参加モードを **{text}** に変更しました。"
+    )
+
+
+@bot.tree.command(name="f_join", description="オープンな派閥に参加します")
+@app_commands.describe(faction_name="参加したい派閥名")
+async def faction_join_cmd(interaction: discord.Interaction, faction_name: str):
+    guild = interaction.guild
+    user = interaction.user
+
+    if guild is None or not isinstance(user, discord.Member):
+        await interaction.response.send_message(
+            "サーバー内でのみ使用できます。",
+            ephemeral=True,
+        )
+        return
+
+    if await get_user_faction_id(user.id, guild.id):
+        await interaction.response.send_message(
+            "すでにどこかの派閥に所属しています。",
+            ephemeral=True,
+        )
+        return
+
+    faction = await get_faction_by_name(faction_name, guild.id)
+    if not faction:
+        await interaction.response.send_message(
+            "指定された派閥が見つかりません。",
+            ephemeral=True,
+        )
+        return
+
+    (
+        faction_id,
+        name,
+        leader_id,
+        base_role_id,
+        leader_role_id,
+        officer_role_id,
+        category_id,
+        forum_channel_id,
+        chat_channel_id,
+        vc_channel_id,
+        listen_vc_channel_id,
+        control_panel_channel_id,
+        destroyed,
+        is_open,
+    ) = faction
+
+    if destroyed:
+        await interaction.response.send_message(
+            "その派閥はすでに解体されています。",
+            ephemeral=True,
+        )
+        return
+
+    if not is_open:
+        await interaction.response.send_message(
+            "その派閥はクローズ状態です。参加には招待が必要です。",
+            ephemeral=True,
+        )
+        return
+
+    base_role = guild.get_role(base_role_id)
+    if not base_role:
+        await interaction.response.send_message(
+            "派閥ロールが見つかりません。管理者に連絡してください。",
+            ephemeral=True,
+        )
+        return
+
+    await user.add_roles(base_role)
+    await add_faction_member(user.id, faction_id, "member")
+    await interaction.response.send_message(
+        f"派閥 **{name}** に参加しました！"
+    )
+
+
+# ===================== 戦争コマンド =====================
+
+@bot.tree.command(name="f_war_start", description="他派閥に戦争を宣言します")
+@app_commands.describe(enemy_faction_name="戦争を仕掛ける相手派閥名")
+async def faction_war_start_cmd(interaction: discord.Interaction, enemy_faction_name: str):
+    guild = interaction.guild
+    user = interaction.user
+
+    if guild is None or not isinstance(user, discord.Member):
+        await interaction.response.send_message(
+            "サーバー内でのみ使用できます。",
+            ephemeral=True,
+        )
+        return
+
+    if await get_active_war(guild.id):
+        await interaction.response.send_message(
+            "既に他の戦争が進行中です。先に終了させてください。",
+            ephemeral=True,
+        )
+        return
+
+    my_faction_id, my_role = await get_faction_role(user.id, guild.id)
+    if not my_faction_id or my_role not in ("leader", "officer"):
+        await interaction.response.send_message(
+            "このコマンドは派閥のリーダーまたは幹部のみ使用できます。",
+            ephemeral=True,
+        )
+        return
+
+    my_faction = await get_faction_by_id(my_faction_id)
+    if not my_faction:
+        await interaction.response.send_message(
+            "自派閥情報が見つかりません。",
+            ephemeral=True,
+        )
+        return
+
+    enemy_faction = await get_faction_by_name(enemy_faction_name, guild.id)
+    if not enemy_faction:
+        await interaction.response.send_message(
+            "指定された派閥が見つかりません。",
+            ephemeral=True,
+        )
+        return
+
+    if enemy_faction[0] == my_faction_id:
+        await interaction.response.send_message(
+            "自分の派閥に戦争を宣言することはできません。",
+            ephemeral=True,
+        )
+        return
+
+    # 戦争開始レコード
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO wars (
+                guild_id, attacker_faction_id, defender_faction_id,
+                active, attacker_messages, defender_messages
+            )
+            VALUES (?, ?, ?, 1, 0, 0)
+            """,
+            (guild.id, my_faction_id, enemy_faction[0]),
+        )
+        await db.commit()
+
+    await interaction.response.send_message(
+        f"派閥 **{my_faction[2]}** が **{enemy_faction[1]}** に戦争を宣言しました！\n"
+        "このメッセージ以降、両派閥メンバーの会話メッセージ数をカウントし、"
+        "より多かった派閥が勝利します。"
+    )
+
+    # 戦争状況チャンネルへ通知
+    war_channel = await get_war_status_channel(guild)
+    if war_channel:
+        await war_channel.send(
+            "⚔️ **戦争開始**\n"
+            f"攻撃側: **{my_faction[2]}**\n"
+            f"防衛側: **{enemy_faction[1]}**\n"
+            "ここに戦争状況が通知されます。"
+        )
+
+
+@bot.tree.command(name="f_war_status", description="現在の戦争状況を表示します")
+async def faction_war_status_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "サーバー内でのみ使用できます。",
+            ephemeral=True,
+        )
+        return
+
+    war = await get_active_war(guild.id)
+    if not war:
+        await interaction.response.send_message(
+            "現在進行中の戦争はありません。",
+            ephemeral=True,
+        )
+        return
+
+    war_id, attacker_id, defender_id, attacker_msgs, defender_msgs = war
+    attacker = await get_faction_by_id(attacker_id)
+    defender = await get_faction_by_id(defender_id)
+    if not attacker or not defender:
+        await interaction.response.send_message(
+            "戦争情報の取得に失敗しました。",
+            ephemeral=True,
+        )
+        return
+
+    msg = (
+        "現在の戦争状況:\n"
+        f"・攻撃側 **{attacker[2]}** メッセージ数: {attacker_msgs}\n"
+        f"・防衛側 **{defender[2]}** メッセージ数: {defender_msgs}"
+    )
+
+    await interaction.response.send_message(msg)
+
+    # 戦争状況チャンネルにも流す
+    war_channel = await get_war_status_channel(guild)
+    if war_channel:
+        await war_channel.send("📊 " + msg)
+
+
+@bot.tree.command(name="f_war_end", description="進行中の戦争を終了し、勝敗を確定します（管理者専用）")
+async def faction_war_end_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    user = interaction.user
+
+    if guild is None or not isinstance(user, discord.Member):
+        await interaction.response.send_message(
+            "サーバー内でのみ使用できます。",
+            ephemeral=True,
+        )
+        return
+
+    if not user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "このコマンドはサーバー管理者のみが実行できます。",
+            ephemeral=True,
+        )
+        return
+
+    war = await get_active_war(guild.id)
+    if not war:
+        await interaction.response.send_message(
+            "現在進行中の戦争はありません。",
+            ephemeral=True,
+        )
+        return
+
+    war_id, attacker_id, defender_id, attacker_msgs, defender_msgs = war
+    attacker = await get_faction_by_id(attacker_id)
+    defender = await get_faction_by_id(defender_id)
+    if not attacker or not defender:
+        await interaction.response.send_message(
+            "戦争情報の取得に失敗しました。",
+            ephemeral=True,
+        )
+        return
+
+    # 勝敗判定
+    if attacker_msgs > defender_msgs:
+        winner, loser = attacker, defender
+        winner_msgs, loser_msgs = attacker_msgs, defender_msgs
+    elif defender_msgs > attacker_msgs:
+        winner, loser = defender, attacker
+        winner_msgs, loser_msgs = defender_msgs, attacker_msgs
+    else:
+        # 引き分け
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE wars SET active = 0 WHERE id = ?", (war_id,))
+            await db.commit()
+        msg = (
+            "戦争は引き分けです。\n"
+            f"攻撃側 **{attacker[2]}**: {attacker_msgs} メッセージ\n"
+            f"防衛側 **{defender[2]}**: {defender_msgs} メッセージ"
+        )
+        await interaction.response.send_message(msg)
+        war_channel = await get_war_status_channel(guild)
+        if war_channel:
+            await war_channel.send("⚪ " + msg)
+        return
+
+    # 負け派閥を解体
+    await destroy_faction(guild, loser)
+
+    # 戦争終了フラグ
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE wars SET active = 0 WHERE id = ?", (war_id,))
+        await db.commit()
+
+    msg = (
+        "戦争終了！\n"
+        f"勝者: **{winner[2]}** （{winner_msgs} メッセージ）\n"
+        f"敗者: **{loser[2]}** （{loser_msgs} メッセージ）\n"
+        f"敗北派閥 **{loser[2]}** は解体されました。"
+    )
+    await interaction.response.send_message(msg)
+
+    war_channel = await get_war_status_channel(guild)
+    if war_channel:
+        await war_channel.send("🏁 " + msg)
+
+
+# ===================== 全体チャンネル作成 =====================
+
+@bot.tree.command(
+    name="setup_global",
+    description="全体雑談・全体VCなどをまとめて作成します（管理者専用）"
+)
+async def setup_global_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    user = interaction.user
+
+    if guild is None or not isinstance(user, discord.Member):
+        await interaction.response.send_message(
+            "サーバー内でのみ使用できます。",
+            ephemeral=True,
+        )
+        return
+
+    if not user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "このコマンドはサーバー管理者のみが実行できます。",
+            ephemeral=True,
+        )
+        return
+
+    category = await guild.create_category("全体")
+
+    # テキストチャンネル
+    await guild.create_text_channel("全体雑談", category=category)
+    await guild.create_text_channel("フォーラム", category=category)
+    await guild.create_text_channel("管理者への意見", category=category)
+
+    # VC
+    await guild.create_voice_channel("全体VC1", category=category)
+    await guild.create_voice_channel("全体VC2", category=category)
+
+    # 聞き専VC
+    overwrites_listen = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=False,
+        )
+    }
+    await guild.create_voice_channel(
+        "全体VC聞き専1",
+        category=category,
+        overwrites=overwrites_listen,
+    )
+    await guild.create_voice_channel(
+        "全体VC聞き専2",
+        category=category,
+        overwrites=overwrites_listen,
+    )
+
+    # 戦争状況チャンネル
+    war_channel = await guild.create_text_channel("戦争状況", category=category)
+    await set_guild_war_status_channel_id(guild.id, war_channel.id)
+
+    await interaction.response.send_message("全体チャンネルと戦争状況チャンネルを作成しました。")
+
+
+# ===================== エントリーポイント =====================
+
+def main():
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise RuntimeError("環境変数 DISCORD_TOKEN にボットトークンを設定してください。")
+    bot.run(token)
+
+
+if __name__ == "__main__":
+    main()
